@@ -1,5 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-only
+# NOTE: в dash (Debian/Ubuntu /bin/sh) встроенная команда `test` не поддерживает
+# унарный `-v`. Для проверки именованной переменной используется `[ "x${VAR+x}" = xx ]`.
+# ============================================================================
 # ============================================================================
 # deck-thermal-guard — пользовательская замена Android thermal-engine для
 # PixelOS-Deck (Snapdragon 845 / blueline). known-issues.md п.3.
@@ -30,6 +33,10 @@
 # ============================================================================
 set -u
 
+# dash-совместимый хелпер: была ли переменная инициализирована в родительском
+# окружении (для test-обвязки, которая экспортирует SYS_PREFIX глобально).
+is_set() { [ "x${1+x}" = xx ]; }
+
 CONF_DEFAULTS() {
     # Значения по умолчанию = configs/blueline.conf (секция THERMAL_*);
     # на устройстве переопределяются файлом /etc/default/deck-thermal.
@@ -43,11 +50,23 @@ CONF_DEFAULTS() {
     WARN_BATT=44000 HOT_BATT=48000 CRIT_BATT=55000
     QUIET=55000
     PERF_OFF=3000
+    # реальные OPP-шаги SD845 (blueline): little policy0 300..1771 MHz,
+    # big policy4 826..2457 MHz. Тестовый фейковый sysfs использует эти списки.
+    OPP_LITTLE="300000 403200 499200 576000 672000 748800 844800 940800 1036800 1113600 1209600 1305600 1382400 1478400 1555200 1632000 1713600 1771200"
+    OPP_BIG="825600 844800 960000 979200 1094400 1209600 1324800 1440000 1555200 1670400 1785600 1900800 1920000 2092800 2284800 2457600"
 }
-CONF_DEFAULTS
-[ -r /etc/default/deck-thermal ] && . /etc/default/deck-thermal
+log() { echo "deck-thermal-guard: $*" >&2; }
 
-RUN_DIR="${SYS_PREFIX}/run"   # на устройстве SYS_PREFIX пуст -> /run
+# SYS_PREFIX позволяет гонять контроллер против фейкового sysfs
+# (интеграционные тесты scripts/test-thermal-guard.sh); на устройстве пусто.
+# ВАЖНО: определение sp()/SYS_PREFIX должно быть ДО первого использования.
+SYS_PREFIX=${SYS_PREFIX:-}
+sp() { printf '%s%s\n' "$SYS_PREFIX" "$1"; }
+
+CONF_DEFAULTS
+if [ -r "$(sp /etc/default/deck-thermal)" ]; then . "$(sp /etc/default/deck-thermal)"; fi
+
+RUN_DIR="$(sp /run)"   # на устройстве SYS_PREFIX пуст -> /run
 STATUS_FILE="$RUN_DIR/deck-thermal-guard.status"
 PRESET_FILE="$RUN_DIR/deck-thermal-guard.preset"
 PID_FILE="$RUN_DIR/deck-thermal-guard.pid"
@@ -55,13 +74,6 @@ PID_FILE="$RUN_DIR/deck-thermal-guard.pid"
 KGSL=$(sp /sys/class/kgsl/kgsl-3d0)
 POLICY_LITTLE=$(sp /sys/devices/system/cpu/cpufreq/policy0)
 POLICY_BIG=$(sp /sys/devices/system/cpu/cpufreq/policy4)
-
-log() { echo "deck-thermal-guard: $*" >&2; }
-
-# SYS_PREFIX позволяет гонять контроллер против фейкового sysfs
-# (интеграционные тесты scripts/test-thermal-guard.sh); на устройстве пусто.
-SYS_PREFIX=${SYS_PREFIX:-}
-sp() { printf '%s%s' "$SYS_PREFIX" "$1"; }
 
 # --------------------------- обнаружение железа ----------------------------
 cpu_max_of() { # $1 = путь policy
@@ -118,6 +130,10 @@ snap_step() { # snap_step target path — ближайший шаг <= target и
     for x in $(tr ' ' '\n' < "$f" | sort -n); do
         [ "$x" -le "$t" ] 2>/dev/null && best=$x
     done
+    if [ "$best" = 0 ]; then
+        # ниже самого минимального шага (floor-расчёты) — берём минимальный OPP
+        best=$(tr ' ' '\n' < "$f" | sort -n | head -1)
+    fi
     echo "$best"
 }
 
@@ -127,6 +143,8 @@ apply_cpu_ceiling() { # apply_cpu_ceiling big_khz little_khz
     bmax=$(cpu_max_of "$POLICY_BIG"); lmax=$(cpu_max_of "$POLICY_LITTLE")
     bfloor=$(( bmax * MIN_BIG_PCT / 100 ))
     lfloor=$(( lmax * 30 / 100 ))
+    [ "$big" -gt "$bmax" ] && big=$bmax     # потолок hardware-максимума (performance +CEIL_ADJ)
+    [ "$little" -gt "$lmax" ] && little=$lmax
     [ "$big" -lt "$bfloor" ] && big=$bfloor
     [ "$little" -lt "$lfloor" ] && little=$lfloor
     big=$(snap_step "$big" "$POLICY_BIG/scaling_available_frequencies")
@@ -163,13 +181,15 @@ apply_gpu_ceiling() { # apply_gpu_ceiling hz
 
 emergency_offline_little() {
     for c in 0 1 2 3; do
-        write_sys 0 "/sys/devices/system/cpu/cpu$c/online" || true
+        write_sys 0 "$(sp /sys/devices/system/cpu/cpu$c/online)" || true
     done
+    LITTLE_OFFLINE=1
 }
 restore_online() {
     for c in 0 1 2 3; do
-        write_sys 1 "/sys/devices/system/cpu/cpu$c/online" || true
+        write_sys 1 "$(sp /sys/devices/system/cpu/cpu$c/online)" || true
     done
+    LITTLE_OFFLINE=0
 }
 
 limit_battery_charge() { # limit_battery_charge current_ma|unlimited
@@ -205,6 +225,7 @@ load_preset() {
         powersave)   CEIL_ADJ=-$(( HYST * 2 )); THRESH_ADJ=-$PERF_OFF ;;
         *)           PRESET=balanced; CEIL_ADJ=0; THRESH_ADJ=0 ;;
     esac
+    mkdir -p "$RUN_DIR" 2>/dev/null || true
     echo "$PRESET" > "$PRESET_FILE" 2>/dev/null || true
     log "preset=$PRESET ceil_adj=$CEIL_ADJ threshold_adj=$THRESH_ADJ"
 }
@@ -215,6 +236,7 @@ eff() { echo $(($1 + THRESH_ADJ)); }
 # --------------------------- контроллер ------------------------------------
 # stage: 0 nom -> 1 warn (-STEP%) -> 2 hot (-2*STEP%) -> 3 crit (floor+offline)
 STAGE=0
+LITTLE_OFFLINE=0
 BIG_MAX=0 LITTLE_MAX=0 GPU_MAX=0
 
 init_limits() {
@@ -262,24 +284,36 @@ tick() {
     [ -z "$tc" ] && tc=0; [ -z "$tg" ] && tg=0; [ -z "$tb" ] && tb=0
 
     new=0
-    [ "$tc" -ge "$(eff "$WARN_CPU")" ] || [ "$tb" -ge "$(eff "$WARN_BATT")" ] || \
-      [ "$tg" -ge "$(eff "$WARN_GPU")" ] && new=1
-    [ "$tc" -ge "$(eff "$HOT_CPU")" ] || [ "$tb" -ge "$(eff "$HOT_BATT")" ] || \
-      [ "$tg" -ge "$(eff "$HOT_GPU")" ] && new=2
-    [ "$tc" -ge "$CRIT_CPU" ] || [ "$tb" -ge "$CRIT_BATT" ] && new=3
+    if [ "$tc" -ge "$(eff "$WARN_CPU")" ] || [ "$tb" -ge "$(eff "$WARN_BATT")" ] || \
+       [ "$tg" -ge "$(eff "$WARN_GPU")" ]; then new=1; fi
+    if [ "$tc" -ge "$(eff "$HOT_CPU")" ] || [ "$tb" -ge "$(eff "$HOT_BATT")" ] || \
+       [ "$tg" -ge "$(eff "$HOT_GPU")" ]; then new=2; fi
+    if [ "$tc" -ge "$CRIT_CPU" ] || [ "$tb" -ge "$CRIT_BATT" ]; then new=3; fi
 
-    # гистерезис: понижаем ступень только если всё остыло ниже (порог_ступени - HYST)
+    # гистерезис: понижаем ступень только если ВСЕ датчики остыли ниже
+    # (порог текущей ступени - HYST); иначе остаёмся на текущей ступени.
     if [ "$new" -lt "$STAGE" ]; then
+        cooled=1
         case "$STAGE" in
-            1) lim=$(eff "$WARN_CPU"); [ "$tc" -lt $((lim - HYST)) ] && [ "$tb" -lt $(( $(eff "$WARN_BATT") - HYST )) ] && new=0 ;;
-            2) lim=$(eff "$HOT_CPU");  [ "$tc" -lt $((lim - HYST)) ] && new=1 ;;
-            3) [ "$tc" -lt $((CRIT_CPU - HYST)) ] && [ "$tb" -lt $((CRIT_BATT - HYST)) ] && new=2 ;;
+            1) lim=$(eff "$WARN_CPU"); blim=$(eff "$WARN_BATT"); glim=$(eff "$WARN_GPU") ;;
+            2) lim=$(eff "$HOT_CPU");  blim=$(eff "$HOT_BATT");  glim=$(eff "$HOT_GPU")  ;;
+            *) lim=$CRIT_CPU;         blim=$CRIT_BATT;          glim=$CRIT_CPU          ;;
         esac
-    fi
-    # полный сброс когда тихо (и пресет не force)
-    if [ "$new" = 0 ] && [ "$STAGE" != 0 ] && [ "$tc" -lt "$QUIET" ] && \
-       [ "$tb" -lt "$QUIET" ] && [ "$tg" -lt "$QUIET" ]; then
-        new=0
+        [ "$tc" -ge $((lim - HYST)) ]  && cooled=0
+        [ "$tb" -ge $((blim - HYST)) ] && cooled=0
+        [ "$tg" -ge $((glim - HYST)) ] && cooled=0
+        if [ "$cooled" = 1 ]; then
+            new=$(( STAGE - 1 ))
+            # полный сброс когда всё тихо ниже QUIET (одним шагом, без skip-каскада)
+            if [ "$new" = 0 ] && [ "$tc" -lt "$QUIET" ] && \
+               [ "$tb" -lt "$QUIET" ] && [ "$tg" -lt "$QUIET" ]; then
+                new=0
+            elif [ "$new" = 0 ]; then
+                new=1   # остыли ниже порога, но ещё тепло — держим stage 1
+            fi
+        else
+            new=$STAGE
+        fi
     fi
 
     if [ "$new" != "$STAGE" ]; then
@@ -292,8 +326,17 @@ tick() {
             emergency_offline_little
             limit_battery_charge 500
         else
-            restore_online
-            limit_battery_charge unlimited
+            # little снова online при любом снижении со stage 3
+            [ "$LITTLE_OFFLINE" = 1 ] && { restore_online; LITTLE_OFFLINE=0; }
+            [ "$STAGE" -lt 3 ] && limit_battery_charge unlimited
+        fi
+    else
+        # Стабильная фаза: если little offline, а температура уже ниже CRIT-HYST —
+        # возвращаем ядра (в тестовом синтетическом sysfs cpuX/online всегда writable).
+        if [ "$LITTLE_OFFLINE" = 1 ] && [ "$tc" -lt $((CRIT_CPU - HYST)) ] && \
+           [ "$tb" -lt $((CRIT_BATT - HYST)) ]; then
+            restore_online; LITTLE_OFFLINE=0
+            log "little cores restored (cooldown)"
         fi
     fi
     if [ "$tb" -ge $((CRIT_BATT + HYST)) ]; then
@@ -340,7 +383,14 @@ cmd_show() {
 }
 cmd_test() { # smoke-прогон одного тика без демона (для verify.py --device)
     init_limits
-    load_preset "${1:-balanced}"
+    # Если контроллер уже работает демоном и выбрал пресет, не переопределяем его
+    # аргументом по умолчанию — иначе test-обвязка будет воевать с daemon'ом.
+    if [ "${1:-}" = "balanced" ] && ! is_set "${TG_PRESET_OVERRIDE:-}" && \
+       [ -r "$PRESET_FILE" ] && [ "$(cat "$PRESET_FILE" 2>/dev/null)" != "balanced" ]; then
+        load_preset "$(cat "$PRESET_FILE")"
+    else
+        load_preset "${1:-balanced}"
+    fi
     tick
     cat "$STATUS_FILE"
 }
