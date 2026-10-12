@@ -113,7 +113,8 @@ def offline_checks():
                    "WARN_CPU": "warn_cpu_m", "HOT_CPU": "hot_cpu_m", "CRIT_CPU": "crit_cpu_m",
                    "WARN_GPU": "warn_gpu_m", "HOT_GPU": "hot_gpu_m",
                    "WARN_BATT": "warn_batt_m", "HOT_BATT": "hot_batt_m",
-                   "CRIT_BATT": "crit_batt_m", "QUIET": "quiet_m", "PERF_OFF": "perf_offset_m"}
+                   "CRIT_BATT": "crit_batt_m", "QUIET": "quiet_m", "PERF_OFF": "perf_offset_m",
+                   "REARM_MARGIN": "rearm_margin_m"}
         for dkey, ckey in mapping.items():
             cv = conf.get(f"THERMAL_{ckey.upper()}")
             if cv is None or dv.get(dkey) != cv:

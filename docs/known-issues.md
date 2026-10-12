@@ -5,8 +5,11 @@
    (`arm-optimizations/dxvk-a630.conf`). Статус: отслеживается upstream Mesa MR!
 2. **2 GiB RAM**: крупные AAA-игры (>4 GiB textures) не помещаются даже с zram —
    ограничение железа, не софта.
-3. **Тепловой троттлинг SD845**: без Android thermal-engine нужен пользовательский
-   thermal-guard (TODO в overlay/usr/local/bin/deck-thermal-guard).
+3. **Тепловой троттлинг SD845**: пользовательский thermal-guard реализован
+   (overlay/usr/local/bin/deck-thermal-guard, unit deck-thermal-guard.service,
+   пресеты balanced/performance/powersave/quiet; пороги — секция THERMAL_* в
+   configs/blueline.conf). Осталось: калибровка порогов на реальном железе после
+   15 мин нагрузки (`deck-thermal-guard show`).
 4. **Прошивки модема/Wi-Fi** лежат в vendor; при wipe vendor сеть не поднимется —
    flash.sh никогда не форматирует vendor.
 5. **Factory images** Google отдаёт только по согласию — автоматическая загрузка

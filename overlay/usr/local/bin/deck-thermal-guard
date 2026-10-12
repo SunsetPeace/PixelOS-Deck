@@ -33,9 +33,10 @@
 # ============================================================================
 set -u
 
-# dash-совместимый хелпер: была ли переменная инициализирована в родительском
-# окружении (для test-обвязки, которая экспортирует SYS_PREFIX глобально).
-is_set() { [ "x${1+x}" = xx ]; }
+# dash-совместимая проверка: была ли переменная установлена в окружении.
+# Вызывается как is_set NAME; ${!NAME} — bash-специфика, в POSIX-sh её нет,
+# поэтому eval с аккуратным именем переменной.
+is_set() { eval "[ \"x\${$1+x}\" = xx ];"; }
 
 CONF_DEFAULTS() {
     # Значения по умолчанию = configs/blueline.conf (секция THERMAL_*);
@@ -50,6 +51,7 @@ CONF_DEFAULTS() {
     WARN_BATT=44000 HOT_BATT=48000 CRIT_BATT=55000
     QUIET=55000
     PERF_OFF=3000
+    REARM_MARGIN=6000   # полоса возврата ступеней (см. tick)
     # реальные OPP-шаги SD845 (blueline): little policy0 300..1771 MHz,
     # big policy4 826..2457 MHz. Тестовый фейковый sysfs использует эти списки.
     OPP_LITTLE="300000 403200 499200 576000 672000 748800 844800 940800 1036800 1113600 1209600 1305600 1382400 1478400 1555200 1632000 1713600 1771200"
@@ -69,12 +71,37 @@ CONF_DEFAULTS
 # через TG_CONF). Порядок: встроенные дефолты -> TG_CONF -> /etc/default.
 if [ -n "${TG_CONF:-}" ] && [ -r "$TG_CONF" ]; then . "$TG_CONF"; fi
 if [ -r "/etc/default/deck-thermal" ]; then . "/etc/default/deck-thermal"; fi
+# Нормализация имён из configs/blueline.conf (секция THERMAL_*): там ключи
+# HYSTERESIS_M / PERF_OFFSET_M; guard использует короткие HYST / PERF_OFF.
+[ -n "${HYSTERESIS:-}" ]  && HYST=$HYSTERESIS
+[ -n "${HYSTERESIS_M:-}" ] && HYST=$HYSTERESIS_M
+[ -n "${PERF_OFFSET:-}" ]   && PERF_OFF=$PERF_OFFSET
+[ -n "${PERF_OFFSET_M:-}" ] && PERF_OFF=$PERF_OFFSET_M
 
 RUN_DIR="$(sp /run)"   # на устройстве SYS_PREFIX пуст -> /run
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 STATUS_FILE="$RUN_DIR/deck-thermal-guard.status"
 PRESET_FILE="$RUN_DIR/deck-thermal-guard.preset"
 PID_FILE="$RUN_DIR/deck-thermal-guard.pid"
+
+# Путь к самому себе — для перезапуска отдельным процессом-демоном (daemonize).
+# $0 при вызове "sh /usr/local/bin/deck-thermal-guard ..." содержит полный путь;
+# если $0 относительный — резолвим от текущего каталога.
+case "$0" in
+    /*) SELF="$0" ;;
+    *)  SELF="$(pwd)/$0" ;;
+esac
+# Интерпретатор для self-exec: на устройстве это /bin/sh (systemd unit), но в
+# интеграционных тестах guard запускается под bash/dash — наследуем, чтобы
+# демон не сменил диалект shell посреди жизненного цикла.
+INTERP="${TG_INTERP_SUB:-${INTERP:-}}"
+if [ -z "$INTERP" ]; then
+    case "$(ps -o comm= -p $$ 2>/dev/null)" in
+        *dash*) INTERP=/bin/dash ;;
+        *bash*) INTERP=/bin/bash ;;
+        *)      INTERP=/bin/sh ;;
+    esac
+fi
 
 KGSL=$(sp /sys/class/kgsl/kgsl-3d0)
 POLICY_LITTLE=$(sp /sys/devices/system/cpu/cpufreq/policy0)
@@ -128,17 +155,23 @@ write_sys() { # write_sys value path... — первый успешный пут
     return 1
 }
 
+opp_list() { # opp_list file — отсортированный список частот из sysfs-файла.
+    # Формат real-kernel: "cpu#0 300000 403200 ..." (первое поле НЕ число), либо
+    # просто числа через пробел (GPU available_frequencies, тестовый фейк).
+    tr ' \t' '\n\n' < "$1" 2>/dev/null | grep -E '^[0-9]+$' | sort -n
+}
+
 snap_step() { # snap_step target path — ближайший шаг <= target из available_steps
     t=$1; f=$2
     [ -r "$f" ] || { echo "$t"; return 0; }
-    best=0
-    for x in $(tr ' ' '\n' < "$f" | sort -n); do
-        case "$x" in *[!0-9]*) continue ;; esac   # в scaling_available_frequencies
-        [ "$x" -le "$t" ] 2>/dev/null && best=$x  # первое поле = cpu#N (не число)
-    done
+    list=$(opp_list "$f")
+    [ -z "$list" ] && { echo "$t"; return 0; }
+    # <= target; если target выше максимума — сам максимум (важно для
+    # performance-пресета: ceiling+CEIL_ADJ обязан квантоваться ВВЕРХ по OPP)
+    best=$(printf '%s\n' "$list" | awk -v t="$t" '$1<=t{b=$1} END{if(b=="")b=0; print b}')
     if [ "$best" = 0 ]; then
         # ниже самого минимального шага (floor-расчёты) — берём минимальный OPP
-        best=$(tr ' \t' '\n\n' < "$f" | grep -E '^[0-9]+$' | sort -n | head -1)
+        best=$(printf '%s\n' "$list" | head -1)
     fi
     echo "$best"
 }
@@ -149,8 +182,10 @@ apply_cpu_ceiling() { # apply_cpu_ceiling big_khz little_khz
     bmax=$(cpu_max_of "$POLICY_BIG"); lmax=$(cpu_max_of "$POLICY_LITTLE")
     bfloor=$(( bmax * MIN_BIG_PCT / 100 ))
     lfloor=$(( lmax * 30 / 100 ))
-    [ "$big" -gt "$bmax" ] && big=$bmax     # потолок hardware-максимума (performance +CEIL_ADJ)
-    [ "$little" -gt "$lmax" ] && little=$lmax
+    # НЕ ограничиваем сверху hardware-максимумом: performance-пресет (CEIL_ADJ=+HYST)
+    # обязан квантоваться ВВЕРХ по OPP-шагам (2457600+3000 -> 2803200? нет, но
+    # powersave/quiet ceil-HYST -> следующий OPP <= target). Ядро само клампит
+    # scaling_max_freq к cpuinfo_max_freq. Floor — только снизу.
     [ "$big" -lt "$bfloor" ] && big=$bfloor
     [ "$little" -lt "$lfloor" ] && little=$lfloor
     big=$(snap_step "$big" "$POLICY_BIG/scaling_available_frequencies")
@@ -165,7 +200,7 @@ apply_gpu_ceiling() { # apply_gpu_ceiling hz
     hz=$1
     df=$(gpu_devfreq_node)
     if [ -n "$df" ]; then
-        gmax=$(tr ' ' '\n' < "$df/available_frequencies" 2>/dev/null | sort -n | tail -1)
+        gmax=$(opp_list "$df/available_frequencies" | tail -1)
         [ -z "$gmax" ] && gmax=$(cat "$df/max_freq" 2>/dev/null || echo 710000000)
         gfloor=$(( gmax * MIN_GPU_PCT / 100 ))
         [ "$hz" -lt "$gfloor" ] && hz=$gfloor
@@ -245,13 +280,30 @@ STAGE=0
 LITTLE_OFFLINE=0
 BIG_MAX=0 LITTLE_MAX=0 GPU_MAX=0
 
+# REARM-каскад в test-режиме: каждый запуск `test` = новый процесс со STAGE=0,
+# поэтому состояние ступени переносится между запусками через STATUS_FILE
+# (dev-заметка: на реальном устройстве демон — долгоживущий процесс, файл
+# пишется им же и читается только monitoring'ом).
+restore_stage() {
+    [ -r "$STATUS_FILE" ] || return 0
+    STAGE=$(sed -n 's/^stage=//p' "$STATUS_FILE" 2>/dev/null | head -1)
+    case "$STAGE" in ''|*[!0-9]*) STAGE=0 ;; esac
+    if [ "$STAGE" -ge 3 ]; then
+        # little мог быть offline предыдущим прогоном — восстанавливаем флаг
+        for c in 0 1 2 3; do
+            f="$(sp /sys/devices/system/cpu/cpu$c/online)"
+            [ -r "$f" ] && [ "$(cat "$f")" = "0" ] && { LITTLE_OFFLINE=1; break; }
+        done
+    fi
+}
+
 init_limits() {
     BIG_MAX=$(cpu_max_of "$POLICY_BIG")
     LITTLE_MAX=$(cpu_max_of "$POLICY_LITTLE")
     GPU_MAX=""
     df=$(gpu_devfreq_node)
     if [ -n "$df" ]; then
-        GPU_MAX=$(tr ' ' '\n' < "$df/available_frequencies" 2>/dev/null | sort -n | tail -1)
+        GPU_MAX=$(opp_list "$df/available_frequencies" | tail -1)
     fi
     if [ -z "$GPU_MAX" ] || [ "$GPU_MAX" = "0" ]; then
         GPU_MAX=$(cat "$KGSL/max_gpuclk" 2>/dev/null || echo 710000000)
@@ -296,27 +348,25 @@ tick() {
        [ "$tg" -ge "$(eff "$HOT_GPU")" ]; then new=2; fi
     if [ "$tc" -ge "$CRIT_CPU" ] || [ "$tb" -ge "$CRIT_BATT" ]; then new=3; fi
 
-    # гистерезис: понижаем ступень только если ВСЕ датчики остыли ниже
-    # (порог текущей ступени - HYST); иначе остаёмся на текущей ступени.
+    # Гистерезис возврата (REARM): понижаем ступень не более чем на одну за тик,
+    # и только когда ВСЕ датчики опустились ниже полосы возврата целевой ступени
+    # (порог цели + REARM_MARGIN). Полоса stage0 = QUIET, stage1 = WARN, stage2 = HOT.
+    # Критическая ступень 3 снимается только при полном остывании (< QUIET) —
+    # conservative по смыслу: с floor-потолками перегрев не уйдёт мгновенно.
     if [ "$new" -lt "$STAGE" ]; then
-        cooled=1
-        case "$STAGE" in
-            1) lim=$(eff "$WARN_CPU"); blim=$(eff "$WARN_BATT"); glim=$(eff "$WARN_GPU") ;;
-            2) lim=$(eff "$HOT_CPU");  blim=$(eff "$HOT_BATT");  glim=$(eff "$HOT_GPU")  ;;
-            *) lim=$CRIT_CPU;         blim=$CRIT_BATT;          glim=$CRIT_CPU          ;;
+        target=$(( STAGE - 1 ))
+        case "$target" in
+            0) wlim=$QUIET;                              bwl=$QUIET;                            gql=$QUIET ;;
+            1) wlim=$(eff "$WARN_CPU");                  bwl=$(eff "$WARN_BATT");                gql=$(eff "$WARN_GPU") ;;
+            2) wlim=$(eff "$HOT_CPU");                   bwl=$(eff "$HOT_BATT");                 gql=$(eff "$HOT_GPU") ;;
+            *) wlim=$(eff "$HOT_CPU");                   bwl=$(eff "$HOT_BATT");                 gql=$(eff "$HOT_GPU") ;;
         esac
-        [ "$tc" -ge $((lim - HYST)) ]  && cooled=0
-        [ "$tb" -ge $((blim - HYST)) ] && cooled=0
-        [ "$tg" -ge $((glim - HYST)) ] && cooled=0
-        if [ "$cooled" = 1 ]; then
-            new=$(( STAGE - 1 ))
-            # полный сброс когда всё тихо ниже QUIET (одним шагом, без skip-каскада)
-            if [ "$new" = 0 ] && [ "$tc" -lt "$QUIET" ] && \
-               [ "$tb" -lt "$QUIET" ] && [ "$tg" -lt "$QUIET" ]; then
-                new=0
-            elif [ "$new" = 0 ]; then
-                new=1   # остыли ниже порога, но ещё тепло — держим stage 1
-            fi
+        rearm_ok=1
+        [ "$tc" -ge $((wlim + REARM_MARGIN)) ]  && rearm_ok=0
+        [ "$tb" -ge $((bwl + REARM_MARGIN)) ]   && rearm_ok=0
+        [ "$tg" -ge $((gql + REARM_MARGIN)) ]   && rearm_ok=0
+        if [ "$rearm_ok" = 1 ]; then
+            new=$target
         else
             new=$STAGE
         fi
@@ -354,7 +404,23 @@ tick() {
     update_status "$tc" "$tg" "$tb"
 }
 
-daemon() {
+# ВАЖНО про PID: `daemon &` в dash/bash НЕ создаёт отдельный процесс —
+# это fork той же shell-функции, у которой $$ остаётся равным PID родителя
+# (cmd_start). Родитель завершается через секунды, и pid-файл с таким PID
+# становился битым (status -> inactive при живом цикле), а cmd_stop убивал бы
+# чужой процесс. Поэтому демон запускается ОТДЕЛЬНЫМ экземпляром скрипта:
+# его $$ стабилен и принадлежит ему одному.
+daemonize() {
+    # $@ = аргументы внутреннего вызова (например: "--daemon-loop")
+    "$INTERP" "$SELF" "$@" </dev/null >/dev/null 2>&1 &
+    # дождаться записи pid-файла (макс ~3 c) — иначе status/stop по гонке
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+        [ -s "$PID_FILE" ] && break
+        sleep 0.3
+    done
+}
+
+daemon_loop() {
     init_limits
     load_preset "$(cat "$PRESET_FILE" 2>/dev/null || echo balanced)"
     echo $$ > "$PID_FILE"
@@ -371,9 +437,14 @@ cmd_start() {
         log "already running (pid $(cat "$PID_FILE"))"
         return 0
     fi
-    daemon &
-    sleep 0.2
-    log "started"
+    rm -f "$PID_FILE"
+    daemonize --daemon-loop
+    if [ -s "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        log "started (pid $(cat "$PID_FILE"))"
+    else
+        log "failed to start daemon"
+        return 1
+    fi
 }
 cmd_stop() {
     [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null
@@ -390,22 +461,30 @@ cmd_show() {
         "$(max_cpu_temp)" "$(gpu_temp)" "$(batt_temp)"
     [ -r "$STATUS_FILE" ] && cat "$STATUS_FILE"
 }
-cmd_test() { # smoke-прогон одного тика без демона (для verify.py --device)
+cmd_test() { # smoke-прогон тиков без демона (для verify.py --device и тестов)
     init_limits
     # Если контроллер уже работает демоном и выбрал пресет, не переопределяем его
     # аргументом по умолчанию — иначе test-обвязка будет воевать с daemon'ом.
-    if [ "${1:-}" = "balanced" ] && ! is_set "${TG_PRESET_OVERRIDE:-}" && \
+    if [ "${1:-}" = "balanced" ] && ! is_set TG_PRESET_OVERRIDE && \
        [ -r "$PRESET_FILE" ] && [ "$(cat "$PRESET_FILE" 2>/dev/null)" != "balanced" ]; then
         load_preset "$(cat "$PRESET_FILE")"
     else
         load_preset "${1:-balanced}"
     fi
-    tick
+    restore_stage   # эмуляция долгоживущего демона: переносим STAGE из status-файла
+    # $2 = число тиков: каждый следующий эмулирует +POLL_MS реального времени.
+    # Нужно для проверки REARM-полосы: ступень спускается не быстрее одной за тик.
+    n=${2:-1}; i=0
+    while [ "$i" -lt "$n" ]; do
+        tick
+        i=$(( i + 1 ))
+    done
     cat "$STATUS_FILE"
 }
 
 case "${TG_LIB_ONLY:-0}" in 1) return 0 2>/dev/null || exit 0 ;; esac
 case "${1:-status}" in
+    --daemon-loop) daemon_loop ;;
     start)     cmd_start ;;
     stop)      cmd_stop ;;
     restart)   cmd_stop; cmd_start ;;
@@ -414,7 +493,7 @@ case "${1:-status}" in
                else echo "inactive"; exit 3; fi ;;
     show)      cmd_show ;;
     set-preset) load_preset "${2:-balanced}" ;;
-    test)      cmd_test "${2:-balanced}" ;;
-    *)         echo "usage: $0 {start|stop|restart|status|show|set-preset <balanced|performance|powersave|quiet>|test [preset]}"; exit 2 ;;
+    test)      cmd_test "${2:-balanced}" "${3:-1}" ;;
+    *)         echo "usage: $0 {start|stop|restart|status|show|set-preset <balanced|performance|powersave|quiet>|test [preset] [ticks]}"; exit 2 ;;
 esac
 exit 0

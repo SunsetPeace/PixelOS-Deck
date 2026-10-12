@@ -17,10 +17,12 @@ ok()   { PASS=$((PASS+1)); echo "  [PASS] $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 assert_eq() { local d=$1 e=$2 a=$3; if [ "$e" = "$a" ]; then ok "$d ($a)"; else bad "$d: ожидалось '$e', получено '$a'"; fi; }
 
-mkdir -p "$R"/sys/class/thermal/thermal_zone{0,1,2} \
-         "$R"/sys/devices/system/cpu/cpufreq/policy{0,4} \
-         "$R"/sys/devices/system/cpu/cpu{0,1,2,3} \
-         "$R/sys/class/devfreq/soc:qcom,gpu-ctx-bw" \
+# ВАЖНО: brace-expansion ({0,1,2}) в dash НЕ поддерживается — список каталогов
+# разворачиваем явно (тест обязан проходить и под TG_INTERP=dash).
+for z in 0 1 2; do mkdir -p "$R/sys/class/thermal/thermal_zone$z"; done
+for p in 0 4; do mkdir -p "$R/sys/devices/system/cpu/cpufreq/policy$p"; done
+for c in 0 1 2 3; do mkdir -p "$R/sys/devices/system/cpu/cpu$c"; done
+mkdir -p "$R/sys/class/devfreq/soc:qcom,gpu-ctx-bw" \
          "$R/sys/class/power_supply/battery" "$R/run" "$R/proc" "$R/etc/default"
 echo cpu-cluster0 > "$R/sys/class/thermal/thermal_zone0/type"; echo 55000 > "$R/sys/class/thermal/thermal_zone0/temp"
 echo cpu-cluster1 > "$R/sys/class/thermal/thermal_zone1/type"; echo 55000 > "$R/sys/class/thermal/thermal_zone1/temp"
@@ -64,16 +66,19 @@ echo "== сценарий 1: холодный старт -> stage 0, потол�
 run_guard test balanced >/dev/null 2>&1
 assert_eq "stage" 0 "$(stage)"; assert_eq "big ceiling" 2457600 "$(cpu_big)"; assert_eq "gpu ceiling" 710000000 "$(gpu_max)"
 
-echo "== сценарий 2: CPU 80000 (warn 78000) -> stage 1, ceiling квантован по шагам"
+echo "== сценарий 2: CPU 80000 (warn 78000) -> stage 1, ceiling квантован по OPP-шагам"
 set_cpu 80000
 run_guard test balanced >/dev/null 2>&1
-assert_eq "stage" 1 "$(stage)"; assert_eq "big ceiling (2211840->ближайший шаг)" 1920000 "$(cpu_big)"
+# big: 2457600*90% = 2211840 -> ближайший OPP <= target = 2092800
+assert_eq "stage" 1 "$(stage)"; assert_eq "big ceiling (2211840->OPP)" 2092800 "$(cpu_big)"
+# gpu: 710000000*90% = 639000000 -> шаг devfreq 624000000
 assert_eq "gpu ceiling (639000000->шаг)" 624000000 "$(gpu_max)"
 
 echo "== сценарий 3: CPU 90000 (hot 88000) -> stage 2 (-2*STEP%)"
 set_cpu 90000
 run_guard test balanced >/dev/null 2>&1
-assert_eq "stage" 2 "$(stage)"; assert_eq "big ceiling" 1771200 "$(cpu_big)"
+# big: 2457600*80% = 1966080 -> OPP 1920000
+assert_eq "stage" 2 "$(stage)"; assert_eq "big ceiling" 1920000 "$(cpu_big)"
 
 echo "== сценарий 4: CPU 96000 (crit 95000) -> stage 3 + offline little"
 set_cpu 96000
@@ -81,12 +86,19 @@ run_guard test balanced >/dev/null 2>&1
 assert_eq "stage" 3 "$(stage)"
 ONL=$(cat "$R/sys/devices/system/cpu/cpu0/online")
 assert_eq "cpu0 online" 0 "$ONL"
-assert_eq "big floor 40%" 983040 "$(sed -n 's/^big_khz=//p' "$R/run/deck-thermal-guard.status")"
+# floor: 2457600*40% = 983040 -> ближайший OPP <= = 979200
+assert_eq "big floor 40%" 979200 "$(sed -n 's/^big_khz=//p' "$R/run/deck-thermal-guard.status")"
 
-echo "== сценарий 5: остывание до 50000 (< QUIET) -> полный сброс, little снова online"
-set_cpu 50000; set_batt 30000
-run_guard test balanced >/dev/null 2>&1
-assert_eq "stage" 0 "$(stage)"
+echo "== сценарий 5: остывание до 40000 (< QUIET) -> сброс ступеней (REARM: не быстрее 1/тик)"
+# ВАЖНО: cmd_test восстанавливает STAGE из STATUS_FILE (эмуляция долгоживущего
+# демона), поэтому каждый запуск = ровно ОДИН тик; счётчик тиков не передаём.
+set_cpu 40000; set_batt 30000   # zone0 остаётся на 55000 — ниже QUIET, но выше warn+batt-полос
+run_guard test balanced >/dev/null 2>&1  # тик 1: stage 3 -> 2 (все датчики < HOT+MARGIN)
+assert_eq "REARM tick1: stage 2" 2 "$(stage)"
+run_guard test balanced >/dev/null 2>&1  # тик 2: stage 2 -> 1 (все датчики < WARN+MARGIN)
+assert_eq "REARM tick2: stage 1" 1 "$(stage)"
+run_guard test balanced >/dev/null 2>&1  # тик 3: stage 1 -> 0, полный сброс актуаторов
+assert_eq "REARM tick3: stage 0" 0 "$(stage)"
 assert_eq "cpu0 online восстановлен" 1 "$(cat "$R/sys/devices/system/cpu/cpu0/online")"
 assert_eq "big ceiling восстановлен" 2457600 "$(cpu_big)"; assert_eq "gpu восстановлен" 710000000 "$(gpu_max)"
 assert_eq "зарядка unlimited" unlimited "$(cat "$R/sys/class/power_supply/battery/input_current_limit")"
@@ -100,30 +112,67 @@ assert_eq "performance: stage при 79000" 0 "$(stage)"
 set_cpu 82000   # выше 78000+3000
 TG_PRESET_OVERRIDE=1 run_guard test performance >/dev/null 2>&1
 assert_eq "performance: stage при 82000" 1 "$(stage)"
-assert_eq "performance: ceiling +HYST квантован" 2284800 "$(cpu_big)"
+# stage1 + CEIL_ADJ(+HYST): floor = 2457600*90%+3000 = 2214840 -> ближайший OPP <= = 2092800
+assert_eq "performance: ceiling квантован (2214840->OPP)" 2092800 "$(cpu_big)"
 run_guard set-preset powersave >/dev/null 2>&1
-set_cpu 55000
+set_cpu 55000   # powersave: warn/hot -PERF_OFF => warn=75000; 55000 < warn -> stage 0
 TG_PRESET_OVERRIDE=1 run_guard test powersave >/dev/null 2>&1
-assert_eq "powersave: ранний троттлинг (ceiling-HYST)" 2284800 "$(cpu_big)"
+assert_eq "powersave: stage при 55000" 0 "$(stage)"
+# stage0 ceiling = max + CEIL_ADJ(-2*HYST=-6000) = 2451600 -> ближайший OPP <= = 2284800.
+# Запускаем С НУЛЯ (fresh STAGE=0): в cmd_test переход 0->0 не вызывает apply, поэтому
+# греем до stage1 и остужаем — REARM-тик применяет powersave-ceiling.
+run_guard test powersave >/dev/null 2>&1   # 1 тик: STAGE=0, cpu=55000 -> остаётся 0
+assert_eq "powersave: fresh stage при 55000" 0 "$(stage)"
+set_cpu 76000   # выше warn-PERF_OFF(75000) -> stage 1
+TG_PRESET_OVERRIDE=1 run_guard test powersave >/dev/null 2>&1
+assert_eq "powersave: ранний stage 1 при 76000" 1 "$(stage)"
+set_cpu 55000   # остывание: REARM 1->0, потолок = snap(2451600)=2284800
+TG_PRESET_OVERRIDE=1 run_guard test powersave >/dev/null 2>&1
+assert_eq "powersave: ранний троттлинг (2451600->OPP)" 2284800 "$(cpu_big)"
+run_guard set-preset quiet >/dev/null 2>&1
+set_cpu 76000
+TG_PRESET_OVERRIDE=1 run_guard test quiet >/dev/null 2>&1    # quiet: warn=75000 -> stage 1
+set_cpu 55000
+TG_PRESET_OVERRIDE=1 run_guard test quiet >/dev/null 2>&1    # REARM -> ceiling как powersave
+assert_eq "quiet: ceiling как powersave" 2284800 "$(cpu_big)"
 run_guard set-preset balanced >/dev/null 2>&1
 
 echo "== сценарий 7: батарея — критический перегрев ограничивает зарядку, shutdown-запрос"
-set_cpu 50000; set_batt 56000   # >= CRIT_BATT 55000
+set_cpu 50000; set_batt 30000
+run_guard test balanced >/dev/null 2>&1   # сброс ступеней перед сценарием
+assert_eq "предусловие: stage 0" 0 "$(stage)"
+set_batt 56000   # >= CRIT_BATT 55000
 run_guard test balanced >/dev/null 2>&1
 assert_eq "stage от батареи" 3 "$(stage)"
 assert_eq "input_current_limit" 500 "$(cat "$R/sys/class/power_supply/battery/input_current_limit")"
 set_batt 60000                  # >= CRIT+HYST -> sysrq emergency
 run_guard test balanced >/dev/null 2>&1
 assert_eq "sysrq power запрошен" b "$(cat "$R/proc/sysrq-trigger")"
-set_batt 30000; run_guard test balanced >/dev/null 2>&1   # возврат к норме
+set_batt 30000; run_guard test balanced >/dev/null 2>&1   # возврат к норме: REARM 3->2 (один тик)
+run_guard test balanced >/dev/null 2>&1                    # REARM 2->1
+run_guard test balanced >/dev/null 2>&1                    # REARM 1->0 (zone0=55000 < QUIET-HYST)
+assert_eq "сценарий 7: полный возврат к stage 0" 0 "$(stage)"
 
 echo "== сценарий 8: daemon start/status/stop (PID-файл, восстановление потолков)"
-run_guard start >/dev/null 2>&1
-sleep 0.3
-run_guard status >/dev/null 2>&1 && ok "status=active" || bad "status inactive"
+# POLL_MS=2000 из конфига -> тик каждые 2 с. Демон наследует PRESET_FILE от
+# предыдущих сценариев — фиксируем balanced явно, иначе пороги поедут.
+run_guard set-preset balanced >/dev/null 2>&1
+( sleep 2.5; echo 96000 > "$R/sys/class/thermal/thermal_zone1/temp" ) & SLOWER=$!
+run_guard start </dev/null >/dev/null 2>&1   # stdin=/dev/null: демон не висит на терминале
+# cmd_start делает sleep 0.2 и fork; pid-файл пишется демоном асинхронно —
+# дожидаемся (макс. 3 с), иначе status/проверка pid провалятся по гонке.
+for _i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$R/run/deck-thermal-guard.pid" ] && break; sleep 0.3; done
+if run_guard status >/dev/null 2>&1; then ok "status=active"; else bad "status inactive"; fi
 [ -s "$R/run/deck-thermal-guard.pid" ] && ok "pid-файл создан" || bad "pid-файл пуст"
+wait $SLOWER
+sleep 4.5   # демон успевает сделать >=2 тика после нагрева -> stage 3
+assert_eq "демон отреагировал на нагрев" 3 "$(stage)"
+assert_eq "little offline демоном" 0 "$(cat "$R/sys/devices/system/cpu/cpu0/online")"
+echo 50000 > "$R/sys/class/thermal/thermal_zone1/temp"
 run_guard stop >/dev/null 2>&1
+sleep 0.3   # даём SIGTERM обработать trap и убрать pid-файл
 assert_eq "после stop: big ceiling" 2457600 "$(cpu_big)"
+assert_eq "после stop: little online" 1 "$(cat "$R/sys/devices/system/cpu/cpu0/online")"
 if run_guard status >/dev/null 2>&1; then bad "демон не остановился"; else ok "status=inactive после stop"; fi
 
 echo
