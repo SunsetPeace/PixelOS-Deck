@@ -88,11 +88,45 @@ def offline_checks():
     r = subprocess.run(["sh", "-n", str(init)], capture_output=True, text=True)
     check("initramfs/init синтаксис", r.returncode == 0, r.stderr[:120])
 
-    # Overlay: systemd unit'ы должны иметь [Unit]/[Service] или [Slice]/[Target]
+    # Overlay: systemd unit'ы должны иметь [Unit]/[Service] или [Slice]/[Install]/[Target]
     units = list((REPO / "overlay/etc/systemd/system").iterdir())
     broken_units = [u.name for u in units if u.suffix in (".service", ".slice", ".target")
                     and not re.search(r"^\[(Unit|Service|Slice|Install|Target)\]", u.read_text(), re.M)]
     check("systemd-units валидны", not broken_units, str(broken_units))
+
+    # Thermal guard: пороги blueline.conf отсортированы и лежат в безопасной полосе;
+    # overlay-дефолты синхронизированы с конфигом (known-issues п.3 закрыт).
+    th = {k[len("THERMAL_"):]: int(v) for k, v in conf.items()
+          if k.startswith("THERMAL_")}
+    order_ok = (th.get("WARN_CPU_M", 0) < th.get("HOT_CPU_M", 0) < th.get("CRIT_CPU_M", 10**9)
+                and th.get("WARN_BATT_M", 0) < th.get("HOT_BATT_M", 0) < th.get("CRIT_BATT_M", 10**9)
+                and th.get("WARN_GPU_M", 0) < th.get("HOT_GPU_M", 0) <= th.get("CRIT_CPU_M", 10**9))
+    bounds_ok = all(0 < th[k] < 120000 for k in
+                    ("WARN_CPU_M", "HOT_CPU_M", "CRIT_CPU_M", "WARN_BATT_M", "CRIT_BATT_M"))
+    check("thermal-пороги отсортированы (warn<hot<crit)", order_ok and bounds_ok, str(th))
+    defaults = REPO / "overlay/etc/default/deck-thermal"
+    sync_bad = []
+    if defaults.exists():
+        dv = dict(re.findall(r"^([A-Z_]+)=(\d+)", defaults.read_text(), re.M))
+        mapping = {"POLL_MS": "poll_ms", "HYST": "hysteresis_m", "STEP_PCT": "step_down_pct",
+                   "MIN_BIG_PCT": "min_big_pct", "MIN_GPU_PCT": "min_gpu_pct",
+                   "WARN_CPU": "warn_cpu_m", "HOT_CPU": "hot_cpu_m", "CRIT_CPU": "crit_cpu_m",
+                   "WARN_GPU": "warn_gpu_m", "HOT_GPU": "hot_gpu_m",
+                   "WARN_BATT": "warn_batt_m", "HOT_BATT": "hot_batt_m",
+                   "CRIT_BATT": "crit_batt_m", "QUIET": "quiet_m", "PERF_OFF": "perf_offset_m"}
+        for dkey, ckey in mapping.items():
+            cv = conf.get(f"THERMAL_{ckey.upper()}")
+            if cv is None or dv.get(dkey) != cv:
+                sync_bad.append(dkey)
+    else:
+        sync_bad.append("overlay/etc/default/deck-thermal отсутствует")
+    check("deck-thermal defaults синхронны с blueline.conf", not sync_bad, ",".join(sync_bad))
+    tg = REPO / "overlay/usr/local/bin/deck-thermal-guard"
+    r = subprocess.run(["sh", "-n", str(tg)], capture_output=True, text=True) if tg.exists() else None
+    check("deck-thermal-guard: скрипт + unit + синтаксис",
+          tg.exists() and os.access(tg, os.X_OK) and r is not None and r.returncode == 0
+          and (REPO / "overlay/etc/systemd/system/deck-thermal-guard.service").exists(),
+          r.stderr[:120] if r else "файл отсутствует")
 
     # Каждый recipe ссылается на ROOTFS (иначе укладка некуда)
     no_rootfs = [s.name for s in (REPO / "recipes").glob("*.sh")
@@ -168,6 +202,18 @@ def device_checks(serial):
 
     rc, out = sh(serial, "pgrep -f 'steam.*-bigpicture' >/dev/null && echo running")
     check("Steam процесс запущен", out.strip() == "running", out)
+
+    rc, out = sh(serial, "/usr/local/bin/deck-thermal-guard test balanced 2>/dev/null | grep -c '='")
+    try:
+        check("deck-thermal-guard: tick работает на железе", int(out or 0) >= 6, f"{out} полей статуса")
+    except ValueError:
+        check("deck-thermal-guard: tick работает на железе", False, out[:60])
+
+    rc, out = sh(serial, "systemctl is-active deck-thermal-guard.service")
+    check("deck-thermal-guard.service активен", out.strip() == "active", out)
+
+    rc, out = sh(serial, "cat /sys/class/thermal/thermal_zone*/type 2>/dev/null | head -3 | tr '\\n' ','")
+    check("thermal zones видны", bool(out.strip(",")), out[:80])
     return 0 if all(ok for _, ok, _ in results) else 1
 
 

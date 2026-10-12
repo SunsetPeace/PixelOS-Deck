@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-3.0-only
+[Unit]
+Description=PixelOS-Deck thermal guard (замена Android thermal-engine для SD845)
+Documentation=file:/usr/local/share/doc/deck-thermal-guard.md
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/deck-thermal-guard start
+ExecStop=/usr/local/bin/deck-thermal-guard stop
+PIDFile=/run/deck-thermal-guard.pid
+Restart=on-failure
+RestartSec=5
+# sysfs-актуаторы требуют root; песочница не нужна — демон только пишет лимиты
+User=root
+Nice=19
+IOSchedulingClass=idle
+MemoryMax=32M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

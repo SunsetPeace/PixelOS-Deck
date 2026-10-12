@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# /etc/default/deck-thermal — пороги deck-thermal-guard.
+# СИНХРОНИЗИРОВАНО С configs/blueline.conf (секция THERMAL_*) — единственный
+# источник правды; при смене baseline перепроверьте оба файла.
+# Единицы: милли-градусы Цельсия (как в /sys/class/thermal/thermal_zone*/temp).
+POLL_MS=2000          # период опроса датчиков, мс
+HYST=3000             # гистерезис ступеней, 3.0 °C
+STEP_PCT=10           # насколько резать ceiling за ступень, %
+MIN_BIG_PCT=40        # пол big cluster, % от cpuinfo_max_freq
+MIN_GPU_PCT=30        # пол GPU, % от max_gpuclk/available_frequencies
+WARN_CPU=78000        # stage 1 (CPU tsens/cluster)
+HOT_CPU=88000         # stage 2
+CRIT_CPU=95000        # stage 3: offline little + floor ceilings
+WARN_GPU=75000        # a630_pwr
+HOT_GPU=85000
+WARN_BATT=44000       # comfort: skin ~45 °C
+HOT_BATT=48000
+CRIT_BATT=55000       # stock battery protection (~60 °C hard limit)
+QUIET=55000           # ниже — сброс ступеней
+PERF_OFF=3000         # performance: сдвиг warn/hot на +3 °C
