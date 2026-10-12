@@ -87,7 +87,7 @@ assemble_boot() {
         --dtb "${BUILD_DIR}/kout/vendor/qcom/proprietary/dtbs/blueline.dtb" \
         --pagesize 4096 \
         --header-version 3 \
-        --os-version 12 --os-patch-level 2022-02-05 \
+        --os-version 12 --os-patch-level 2022-06-05 \
         --cmdline "androidboot.hardware=qcom androidboot.console=ttyMSM0 lpm_levels.sleep_disabled=1 service_locator.enable=1 swiotlb=1 androidboot.configfs=true firmware_class.path=/vendor/firmware_mnt/image loop.max_part=7 kpti=off" \
         --output "${OUT_DIR}/boot.img"
     [[ -f "${OUT_DIR}/boot.img" ]] || die "mkbootimg не создал boot.img"
