@@ -64,9 +64,14 @@ SYS_PREFIX=${SYS_PREFIX:-}
 sp() { printf '%s%s\n' "$SYS_PREFIX" "$1"; }
 
 CONF_DEFAULTS
-if [ -r "$(sp /etc/default/deck-thermal)" ]; then . "$(sp /etc/default/deck-thermal)"; fi
+# Конфиг читается по РЕАЛЬНОМУ пути /etc (SYS_PREFIX относится только к
+# sysfs/procfs — на устройстве префикс пуст, в тестах конфиг подсовывается
+# через TG_CONF). Порядок: встроенные дефолты -> TG_CONF -> /etc/default.
+if [ -n "${TG_CONF:-}" ] && [ -r "$TG_CONF" ]; then . "$TG_CONF"; fi
+if [ -r "/etc/default/deck-thermal" ]; then . "/etc/default/deck-thermal"; fi
 
 RUN_DIR="$(sp /run)"   # на устройстве SYS_PREFIX пуст -> /run
+mkdir -p "$RUN_DIR" 2>/dev/null || true
 STATUS_FILE="$RUN_DIR/deck-thermal-guard.status"
 PRESET_FILE="$RUN_DIR/deck-thermal-guard.preset"
 PID_FILE="$RUN_DIR/deck-thermal-guard.pid"
@@ -128,11 +133,12 @@ snap_step() { # snap_step target path — ближайший шаг <= target и
     [ -r "$f" ] || { echo "$t"; return 0; }
     best=0
     for x in $(tr ' ' '\n' < "$f" | sort -n); do
-        [ "$x" -le "$t" ] 2>/dev/null && best=$x
+        case "$x" in *[!0-9]*) continue ;; esac   # в scaling_available_frequencies
+        [ "$x" -le "$t" ] 2>/dev/null && best=$x  # первое поле = cpu#N (не число)
     done
     if [ "$best" = 0 ]; then
         # ниже самого минимального шага (floor-расчёты) — берём минимальный OPP
-        best=$(tr ' ' '\n' < "$f" | sort -n | head -1)
+        best=$(tr ' \t' '\n\n' < "$f" | grep -E '^[0-9]+$' | sort -n | head -1)
     fi
     echo "$best"
 }
@@ -326,9 +332,12 @@ tick() {
             emergency_offline_little
             limit_battery_charge 500
         else
-            # little снова online при любом снижении со stage 3
-            [ "$LITTLE_OFFLINE" = 1 ] && { restore_online; LITTLE_OFFLINE=0; }
-            [ "$STAGE" -lt 3 ] && limit_battery_charge unlimited
+            # little снова online при ЛЮБОМ переходе ниже stage 3
+            # (в т.ч. многоступенчатом 3->0 в test-режиме) + снятие лимита зарядки
+            if [ "$LITTLE_OFFLINE" = 1 ]; then
+                restore_online; LITTLE_OFFLINE=0
+            fi
+            limit_battery_charge unlimited
         fi
     else
         # Стабильная фаза: если little offline, а температура уже ниже CRIT-HYST —
@@ -395,6 +404,7 @@ cmd_test() { # smoke-прогон одного тика без демона (д�
     cat "$STATUS_FILE"
 }
 
+case "${TG_LIB_ONLY:-0}" in 1) return 0 2>/dev/null || exit 0 ;; esac
 case "${1:-status}" in
     start)     cmd_start ;;
     stop)      cmd_stop ;;
