@@ -1,0 +1,360 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+# ============================================================================
+# deck-thermal-guard — пользовательская замена Android thermal-engine для
+# PixelOS-Deck (Snapdragon 845 / blueline). known-issues.md п.3.
+#
+# Закрывает thermal-полосу SD845 без root-APK и без vendor-демонов:
+#   * опрашивает /sys/class/thermal/thermal_zone*/temp (милли-°C);
+#   * ступенчато режет cpufreq ceiling (policy0=little, policy4=big) и
+#     GPU max_freq (devfreq kgsl-3d0/msm-adreno или KGSL max_gpuclk/min_gpuclk);
+#   * на критических температурах отключает little-кластер (cpuX/online),
+#     ограничивает battery charging (charge_type -> INPUT_CURRENT_LIMIT),
+#     при перегреве батареи пишет emergency shutdown request;
+#   * гистерезис + floor (не ниже THERMAL_MIN_*_PCT от аппаратного максимума),
+#     чтобы не «пилить» частоты на границе порога.
+#
+# Пресеты производительности (--preset или echo > run-file):
+#   balanced     дефолт: все пороги из configs/blueline.conf;
+#   performance  ceiling +HYSTERESIS, warn/hot сдвинуты на +PERF_OFFSET,
+#                critical НЕ двигается (безопасность);
+#   powersave    ceiling = floor пресета сразу, пороги сдвинуты на -OFFSET
+#                (ранний троттлинг, минимальный нагрев корпуса);
+#   quiet        как powersave + дополнительно снижает ceiling во время
+#                игровой сессии (для тишины/кожи ~40 °C).
+#
+# Управление из UI/сессии (deck-gamescope-session вызывает start/stop):
+#   deck-thermal-guard start|stop|status|show|set-preset <p>|test
+#   status-file: /run/deck-thermal-guard.status (key=value)
+#   preset-run : /run/deck-thermal-guard.preset
+# ============================================================================
+set -u
+
+CONF_DEFAULTS() {
+    # Значения по умолчанию = configs/blueline.conf (секция THERMAL_*);
+    # на устройстве переопределяются файлом /etc/default/deck-thermal.
+    POLL_MS=2000
+    HYST=3000
+    STEP_PCT=10
+    MIN_BIG_PCT=40
+    MIN_GPU_PCT=30
+    WARN_CPU=78000 HOT_CPU=88000 CRIT_CPU=95000
+    WARN_GPU=75000 HOT_GPU=85000
+    WARN_BATT=44000 HOT_BATT=48000 CRIT_BATT=55000
+    QUIET=55000
+    PERF_OFF=3000
+}
+CONF_DEFAULTS
+[ -r /etc/default/deck-thermal ] && . /etc/default/deck-thermal
+
+RUN_DIR="${SYS_PREFIX}/run"   # на устройстве SYS_PREFIX пуст -> /run
+STATUS_FILE="$RUN_DIR/deck-thermal-guard.status"
+PRESET_FILE="$RUN_DIR/deck-thermal-guard.preset"
+PID_FILE="$RUN_DIR/deck-thermal-guard.pid"
+
+KGSL=$(sp /sys/class/kgsl/kgsl-3d0)
+POLICY_LITTLE=$(sp /sys/devices/system/cpu/cpufreq/policy0)
+POLICY_BIG=$(sp /sys/devices/system/cpu/cpufreq/policy4)
+
+log() { echo "deck-thermal-guard: $*" >&2; }
+
+# SYS_PREFIX позволяет гонять контроллер против фейкового sysfs
+# (интеграционные тесты scripts/test-thermal-guard.sh); на устройстве пусто.
+SYS_PREFIX=${SYS_PREFIX:-}
+sp() { printf '%s%s' "$SYS_PREFIX" "$1"; }
+
+# --------------------------- обнаружение железа ----------------------------
+cpu_max_of() { # $1 = путь policy
+    [ -r "$1/cpuinfo_max_freq" ] && cat "$1/cpuinfo_max_freq" || echo 0
+}
+gpu_devfreq_node() {
+    ls -d "$(sp /sys)/class"/devfreq/*kgsl-3d0* "$(sp /sys)/class"/devfreq/*msm_adreno* \
+          "$(sp /sys)/class"/devfreq/*gpu* 2>/dev/null | head -1
+}
+zone_temp_by_type() { # печатает temp первого зоны по regex типа
+    for z in "$(sp /sys)/class"/thermal/thermal_zone*; do
+        [ -r "$z/type" ] || continue
+        if grep -qiE "$1" "$z/type"; then
+            cat "$z/temp" 2>/dev/null && return 0
+        fi
+    done
+    return 1
+}
+max_cpu_temp() {
+    best=0
+    for z in "$(sp /sys)/class"/thermal/thermal_zone*; do
+        [ -r "$z/temp" ] || continue
+        case "$(cat "$z/type" 2>/dev/null)" in
+            *cpu*|*cluster*|*tsens*|qcom*) t=$(cat "$z/temp" 2>/dev/null || echo 0) ;;
+            *) continue ;;
+        esac
+        [ "$t" -gt "$best" ] 2>/dev/null && best=$t
+    done
+    echo "$best"
+}
+gpu_temp() { zone_temp_by_type 'a630|gpu' || echo 0; }
+batt_temp() {
+    for p in "$(sp /sys)/class"/power_supply/battery/temp \
+             "$(sp /sys)/class"/power_supply/BAT0/temp \
+             "$(sp /sys)/class"/power_supply/bms/temp; do
+        [ -r "$p" ] && { cat "$p"; return 0; }
+    done
+    echo 0
+}
+
+# --------------------------- актуаторы -------------------------------------
+write_sys() { # write_sys value path... — первый успешный путь
+    val=$1; shift
+    for p in "$@"; do
+        [ -w "$p" ] && { echo "$val" > "$p" 2>/dev/null && return 0; }
+    done
+    return 1
+}
+
+snap_step() { # snap_step target path — ближайший шаг <= target из available_steps
+    t=$1; f=$2
+    [ -r "$f" ] || { echo "$t"; return 0; }
+    best=0
+    for x in $(tr ' ' '\n' < "$f" | sort -n); do
+        [ "$x" -le "$t" ] 2>/dev/null && best=$x
+    done
+    echo "$best"
+}
+
+apply_cpu_ceiling() { # apply_cpu_ceiling big_khz little_khz
+    big=$1; little=$2
+    [ -d "$POLICY_BIG" ] || return 0
+    bmax=$(cpu_max_of "$POLICY_BIG"); lmax=$(cpu_max_of "$POLICY_LITTLE")
+    bfloor=$(( bmax * MIN_BIG_PCT / 100 ))
+    lfloor=$(( lmax * 30 / 100 ))
+    [ "$big" -lt "$bfloor" ] && big=$bfloor
+    [ "$little" -lt "$lfloor" ] && little=$lfloor
+    big=$(snap_step "$big" "$POLICY_BIG/scaling_available_frequencies")
+    little=$(snap_step "$little" "$POLICY_LITTLE/scaling_available_frequencies")
+    [ "$big" = 0 ] && big=$bmax; [ "$little" = 0 ] && little=$lmax
+    write_sys "$big" "$POLICY_BIG/scaling_max_freq" || true
+    write_sys "$little" "$POLICY_LITTLE/scaling_max_freq" || true
+    CUR_BIG=$big; CUR_LITTLE=$little
+}
+
+apply_gpu_ceiling() { # apply_gpu_ceiling hz
+    hz=$1
+    df=$(gpu_devfreq_node)
+    if [ -n "$df" ]; then
+        gmax=$(tr ' ' '\n' < "$df/available_frequencies" 2>/dev/null | sort -n | tail -1)
+        [ -z "$gmax" ] && gmax=$(cat "$df/max_freq" 2>/dev/null || echo 710000000)
+        gfloor=$(( gmax * MIN_GPU_PCT / 100 ))
+        [ "$hz" -lt "$gfloor" ] && hz=$gfloor
+        hz=$(snap_step "$hz" "$df/available_frequencies")
+        [ "$hz" = 0 ] && hz=$gmax
+        write_sys "$hz" "$df/min_freq" "$df/scaling_min_freq" || true
+        write_sys "$hz" "$df/max_freq" "$df/scaling_max_freq" || true
+        CUR_GPU=$hz
+    elif [ -d "$KGSL" ]; then
+        gmax=$(cat "$KGSL/max_gpuclk" 2>/dev/null || echo 710000000)
+        gfloor=$(( gmax * MIN_GPU_PCT / 100 ))
+        [ "$hz" -lt "$gfloor" ] && hz=$gfloor
+        write_sys "$hz" "$KGSL/gpuclk" "$KGSL/min_gpuclk" || true
+        CUR_GPU=$hz
+    else
+        CUR_GPU=0
+    fi
+}
+
+emergency_offline_little() {
+    for c in 0 1 2 3; do
+        write_sys 0 "/sys/devices/system/cpu/cpu$c/online" || true
+    done
+}
+restore_online() {
+    for c in 0 1 2 3; do
+        write_sys 1 "/sys/devices/system/cpu/cpu$c/online" || true
+    done
+}
+
+limit_battery_charge() { # limit_battery_charge current_ma|unlimited
+    cur=$1
+    ct=$(cat "$(sp /sys)/class"/power_supply/battery/charge_type 2>/dev/null || \
+        cat "$(sp /sys)/class"/power_supply/BAT0/charge_type 2>/dev/null || echo "")
+    [ -z "$ct" ] && return 0
+    if [ "$cur" = unlimited ]; then
+        write_sys unlimited "$(sp /sys)/class"/power_supply/battery/input_current_limit || true
+    else
+        write_sys "$cur" "$(sp /sys)/class"/power_supply/battery/input_current_limit \
+                             "$(sp /sys)/class"/power_supply/BAT0/input_current_limit || true
+    fi
+}
+
+request_shutdown() {
+    log "CRITICAL battery temperature — emergency shutdown"
+    # штатный путь: systemd получает emergency request (unit'ы остановятся
+    # корректно, ФС не повредятся); sysrq power — fallback без systemd.
+    systemctl --no-block start emergency-shutdown.target 2>/dev/null || true
+    echo b > "$(sp /proc)/sysrq-trigger" 2>/dev/null || true
+}
+
+# --------------------------- пресеты -----------------------------------------
+PRESET=balanced
+CEIL_ADJ=0        # мГц-сдвиг ceiling (в kHz для CPU, Hz для GPU — см. ниже)
+THRESH_ADJ=0      # сдвиг warn/hot порогов
+load_preset() {
+    PRESET=${1:-balanced}
+    case "$PRESET" in
+        performance) CEIL_ADJ=$HYST;  THRESH_ADJ=$PERF_OFF ;;
+        quiet)       CEIL_ADJ=-$(( HYST * 2 )); THRESH_ADJ=-$PERF_OFF ;;
+        powersave)   CEIL_ADJ=-$(( HYST * 2 )); THRESH_ADJ=-$PERF_OFF ;;
+        *)           PRESET=balanced; CEIL_ADJ=0; THRESH_ADJ=0 ;;
+    esac
+    echo "$PRESET" > "$PRESET_FILE" 2>/dev/null || true
+    log "preset=$PRESET ceil_adj=$CEIL_ADJ threshold_adj=$THRESH_ADJ"
+}
+
+# effective thresholds
+eff() { echo $(($1 + THRESH_ADJ)); }
+
+# --------------------------- контроллер ------------------------------------
+# stage: 0 nom -> 1 warn (-STEP%) -> 2 hot (-2*STEP%) -> 3 crit (floor+offline)
+STAGE=0
+BIG_MAX=0 LITTLE_MAX=0 GPU_MAX=0
+
+init_limits() {
+    BIG_MAX=$(cpu_max_of "$POLICY_BIG")
+    LITTLE_MAX=$(cpu_max_of "$POLICY_LITTLE")
+    GPU_MAX=""
+    df=$(gpu_devfreq_node)
+    if [ -n "$df" ]; then
+        GPU_MAX=$(tr ' ' '\n' < "$df/available_frequencies" 2>/dev/null | sort -n | tail -1)
+    fi
+    if [ -z "$GPU_MAX" ] || [ "$GPU_MAX" = "0" ]; then
+        GPU_MAX=$(cat "$KGSL/max_gpuclk" 2>/dev/null || echo 710000000)
+    fi
+    [ -z "$GPU_MAX" ] && GPU_MAX=710000000
+}
+
+ceiling_for_stage() { # echo "<big_khz> <little_khz> <gpu_hz>"
+    s=$1
+    case "$s" in
+        0) bf=$(( BIG_MAX + CEIL_ADJ )); lf=$(( LITTLE_MAX + CEIL_ADJ )); gf=$(( GPU_MAX + CEIL_ADJ )) ;;
+        1) bf=$(( BIG_MAX * (100 - STEP_PCT) / 100 + CEIL_ADJ )); lf=$(( LITTLE_MAX * (100 - STEP_PCT) / 100 + CEIL_ADJ )); gf=$(( GPU_MAX * (100 - STEP_PCT) / 100 + CEIL_ADJ )) ;;
+        2) bf=$(( BIG_MAX * (100 - 2 * STEP_PCT) / 100 + CEIL_ADJ )); lf=$(( LITTLE_MAX * (100 - 2 * STEP_PCT) / 100 + CEIL_ADJ )); gf=$(( GPU_MAX * (100 - 2 * STEP_PCT) / 100 + CEIL_ADJ )) ;;
+        *) bf=$(( BIG_MAX * MIN_BIG_PCT / 100 )); lf=$(( LITTLE_MAX * 30 / 100 )); gf=$(( GPU_MAX * MIN_GPU_PCT / 100 )) ;;
+    esac
+    echo "$bf $lf $gf"
+}
+
+update_status() {
+    tc=$1 tg=$2 tb=$3
+    cat > "$STATUS_FILE" <<EOF
+preset=$PRESET
+stage=$STAGE
+cpu_mdeg=$tc
+gpu_mdeg=$tg
+battery_mdeg=$tb
+big_khz=${CUR_BIG:-0}
+little_khz=${CUR_LITTLE:-0}
+gpu_hz=${CUR_GPU:-0}
+poll_ms=$POLL_MS
+EOF
+}
+
+tick() {
+    tc=$(max_cpu_temp); tg=$(gpu_temp); tb=$(batt_temp)
+    [ -z "$tc" ] && tc=0; [ -z "$tg" ] && tg=0; [ -z "$tb" ] && tb=0
+
+    new=0
+    [ "$tc" -ge "$(eff "$WARN_CPU")" ] || [ "$tb" -ge "$(eff "$WARN_BATT")" ] || \
+      [ "$tg" -ge "$(eff "$WARN_GPU")" ] && new=1
+    [ "$tc" -ge "$(eff "$HOT_CPU")" ] || [ "$tb" -ge "$(eff "$HOT_BATT")" ] || \
+      [ "$tg" -ge "$(eff "$HOT_GPU")" ] && new=2
+    [ "$tc" -ge "$CRIT_CPU" ] || [ "$tb" -ge "$CRIT_BATT" ] && new=3
+
+    # гистерезис: понижаем ступень только если всё остыло ниже (порог_ступени - HYST)
+    if [ "$new" -lt "$STAGE" ]; then
+        case "$STAGE" in
+            1) lim=$(eff "$WARN_CPU"); [ "$tc" -lt $((lim - HYST)) ] && [ "$tb" -lt $(( $(eff "$WARN_BATT") - HYST )) ] && new=0 ;;
+            2) lim=$(eff "$HOT_CPU");  [ "$tc" -lt $((lim - HYST)) ] && new=1 ;;
+            3) [ "$tc" -lt $((CRIT_CPU - HYST)) ] && [ "$tb" -lt $((CRIT_BATT - HYST)) ] && new=2 ;;
+        esac
+    fi
+    # полный сброс когда тихо (и пресет не force)
+    if [ "$new" = 0 ] && [ "$STAGE" != 0 ] && [ "$tc" -lt "$QUIET" ] && \
+       [ "$tb" -lt "$QUIET" ] && [ "$tg" -lt "$QUIET" ]; then
+        new=0
+    fi
+
+    if [ "$new" != "$STAGE" ]; then
+        log "stage $STAGE -> $new (cpu=$tc gpu=$tg batt=$tb)"
+        STAGE=$new
+        set -- $(ceiling_for_stage "$STAGE")
+        apply_cpu_ceiling "$1" "$2"
+        apply_gpu_ceiling "$3"
+        if [ "$STAGE" = 3 ]; then
+            emergency_offline_little
+            limit_battery_charge 500
+        else
+            restore_online
+            limit_battery_charge unlimited
+        fi
+    fi
+    if [ "$tb" -ge $((CRIT_BATT + HYST)) ]; then
+        request_shutdown
+    fi
+    update_status "$tc" "$tg" "$tb"
+}
+
+daemon() {
+    init_limits
+    load_preset "$(cat "$PRESET_FILE" 2>/dev/null || echo balanced)"
+    echo $$ > "$PID_FILE"
+    trap 'rm -f "$PID_FILE"; exit 0' INT TERM
+    log "daemon started pid=$$ poll=${POLL_MS}ms"
+    while :; do
+        tick
+        sleep "$(( POLL_MS / 1000 ))"
+    done
+}
+
+cmd_start() {
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        log "already running (pid $(cat "$PID_FILE"))"
+        return 0
+    fi
+    daemon &
+    sleep 0.2
+    log "started"
+}
+cmd_stop() {
+    [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null
+    rm -f "$PID_FILE"
+    # вернуть максимумы
+    init_limits; apply_cpu_ceiling "$BIG_MAX" "$LITTLE_MAX"; apply_gpu_ceiling "$GPU_MAX"
+    restore_online; limit_battery_charge unlimited
+    log "stopped, ceilings restored"
+}
+cmd_show() {
+    init_limits
+    printf 'hardware: big=%s kHz little=%s kHz gpu=%s Hz\n' "$BIG_MAX" "$LITTLE_MAX" "$GPU_MAX"
+    printf 'zones   : cpu=%s m°C gpu=%s m°C battery=%s m°C\n' \
+        "$(max_cpu_temp)" "$(gpu_temp)" "$(batt_temp)"
+    [ -r "$STATUS_FILE" ] && cat "$STATUS_FILE"
+}
+cmd_test() { # smoke-прогон одного тика без демона (для verify.py --device)
+    init_limits
+    load_preset "${1:-balanced}"
+    tick
+    cat "$STATUS_FILE"
+}
+
+case "${1:-status}" in
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
+    restart)   cmd_stop; cmd_start ;;
+    status)    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+                   echo "active ($(cat "$PID_FILE"))"; [ -r "$STATUS_FILE" ] && cat "$STATUS_FILE"
+               else echo "inactive"; exit 3; fi ;;
+    show)      cmd_show ;;
+    set-preset) load_preset "${2:-balanced}" ;;
+    test)      cmd_test "${2:-balanced}" ;;
+    *)         echo "usage: $0 {start|stop|restart|status|show|set-preset <balanced|performance|powersave|quiet>|test [preset]}"; exit 2 ;;
+esac
+exit 0

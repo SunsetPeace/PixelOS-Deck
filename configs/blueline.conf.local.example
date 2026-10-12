@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# ============================================================================
+# configs/blueline.conf.local — ЛОКАЛЬНЫЕ пути и overrides. Скопируйте:
+#   cp configs/blueline.conf.local.example configs/blueline.conf.local
+# и заполните под своё окружение. Файл НЕ коммитится (см. .gitignore).
+# Загружается scripts/lib.sh:load_config() ПОСЛЕ configs/blueline.conf,
+# поэтому здесь можно переопределить любую переменную baseline-конфига.
+# ============================================================================
+
+# --- Factory-образ Pixel 3 (blueline) --------------------------------------
+# Google раздаёт images только через веб-согласие на
+# https://developers.google.com/android/images — автоскачивание невозможно,
+# поэтому архив скачивается вручную и указывается путь сюда.
+# ВАЖНО про версию: SQ1A.220205.002 — это Android 12L (API 32), она
+# публиковалась для Pixel 4/4XL/4a и НОВЕЙШИХ моделей; последняя официальная
+# сборка именно для Pixel 3 (blueline) — SP1A.210812.016.C2 (Android 12,
+# июнь 2022). Baseline в blueline.conf выставлен в SP1A.210812.016.C2.
+# Скачайте factory-zip для СВОЕЙ модели и укажите путь:
+#   FACTORY_LOCAL="$HOME/dl/blueline-sp1a.210812.016.c2-factory-98b17bef.zip"
+FACTORY_LOCAL=""
+
+# Если используете другой baseline — переопределите здесь (и перепроверьте
+# размеры разделов через `scripts/prepare-device.sh dump-partitions`):
+# ANDROID_BASELINE="SP1A.210812.016.C2"
+
+# --- Proton-ARM64 (staged build) --------------------------------------------
+# x86/x64-игры работают только через FEX + staged-сборку Proton (wg-cand или
+# GTK). Без этой переменной recipes/steam.sh выдаст warning, а запуск
+# Windows-игр будет невозможен. См. docs/status.md (🔴).
+PROTON_STAGED="$HOME/staged/proton-arm64"
+
+# --- Деревья исходников ------------------------------------------------------
+# Куда cloner/repo кладут ядро (msm-4.9 или GKI android15-6.6).
+KERNEL_DIR="$HOME/kernels"
+
+# --- Выходные каталоги (по умолчанию $REPO/build/<device>/...) --------------
+# BUILD_DIR="/mnt/big/pixelos-deck/build"
+# OUT_DIR="/mnt/big/pixelos-deck/out"
+# CACHE_DIR="$HOME/.cache/pixelos-deck"
+
+# --- Целевые разделы DECK (если переименованы/разрезаны иначе) --------------
+# Только после сверки с dump-partitions!
+# DECK_PARTITION_A="system_a"
+# DECK_PARTITION_B="system_b"

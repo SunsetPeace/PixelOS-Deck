@@ -73,6 +73,10 @@ EOF
     chmod 440 "$ROOTFS/etc/sudoers.d/deck"
     ln -sf /usr/lib/systemd/system/multi-user.target.wants/steamdeck-session.service \
         "$ROOTFS/etc/systemd/system/multi-user.target.wants/steamdeck-session.service" 2>/dev/null || true
+    # thermal-guard включаем всегда: без него SD845 уходит в аварийный троттлинг
+    mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
+    ln -sf /etc/systemd/system/deck-thermal-guard.service \
+        "$ROOTFS/etc/systemd/system/multi-user.target.wants/deck-thermal-guard.service"
 }
 
 make_image() {

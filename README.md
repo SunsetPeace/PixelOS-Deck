@@ -60,8 +60,8 @@ docs/                         архитектура, статус портир�
 ```bash
 cp configs/blueline.conf.local.example configs/blueline.conf.local   # пути к SDK/factory-образу
 sudo scripts/setup-host.sh                                            # пакеты, udev-правила, loop/tun
-scripts/prepare-device.sh download-factory                            # тянет factory blueline от Google
-scripts/build-boot.sh                                                 # GKI-ядро + DTBO + ramdisk -> boot.img
+scripts/prepare-device.sh download-factory                            # factory blueline: Google раздаёт zip только через веб-согласие (https://developers.google.com/android/images) — скачайте вручную и укажите FACTORY_LOCAL в conf.local; скрипт проверит sha256 и распакует
+scripts/build-boot.sh                                                 # GKI-ядро + DTBO + ramdisk -> boot.img (--legacy-4.9 для старта)
 scripts/build-rootfs.sh                                               # erofs targetfs (Arch ARM + компоненты)
 scripts/build-images.sh                                               # super.img, vbmeta, fastboot-директории
 adb reboot bootloader && scripts/flash.sh --slots both --wipe-data
