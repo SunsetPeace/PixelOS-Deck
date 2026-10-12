@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# KGSL (vendor-ядро Pixel 3) и msm-gpu (GKI): доступ для группы render,
+# governor devfreq — powersave в простое, userspace во время сессии.
+SUBSYSTEM=="kgsl", KERNEL=="kgsl-3d0", GROUP="render", MODE="0660"
+SUBSYSTEM=="devfreq", ATTR{../governor}!="", RUN+="/usr/local/bin/deck-devfreq-init %k"
+KERNEL=="tty0", GROUP="video", MODE="0666"

@@ -1,0 +1,6 @@
+#!/bin/sh
+# udev RUN-хук: назначаем governor devfreq-узлам при появлении.
+case "$1" in
+  *kgsl-3d*) echo "simple" > "/sys/class/devfreq/$1/governor" 2>/dev/null || true ;;
+  *bus|*bw|*memlat) echo "performance" > "/sys/class/devfreq/$1/governor" 2>/dev/null || true ;;
+esac

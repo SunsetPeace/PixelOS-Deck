@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-3.0-only
+[Unit]
+Description=Deck power save (throttle when session stopped)

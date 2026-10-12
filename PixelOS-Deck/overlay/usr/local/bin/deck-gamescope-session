@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+# Скрипт сессии в стиле SteamOS gamescope-session: поднимает pipewire,
+# kwin-wayland внутри gamescope, затем Big Picture. При падении — возврат
+# в recovery UI (как steam-deck-session.service в SteamOS).
+set -eu
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+mkdir -p "$XDG_RUNTIME_DIR"; chown "$(id -un)" "$XDG_RUNTIME_DIR"
+
+pipewire & PW=$!
+wireplumber & WP=$!
+trap 'kill $PW $WP 2>/dev/null || true' EXIT
+
+# Тепловой контроль активен только во время сессии: вне её guard тоже
+# работает (systemd unit), но пресет берём из /run/deck-thermal-guard.preset,
+# а на старте сессии убеждаемся, что демон поднят.
+/usr/local/bin/deck-thermal-guard start >/dev/null 2>&1 || true
+
+exec /usr/local/bin/deck-steam-launch

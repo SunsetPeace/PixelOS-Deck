@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-3.0-only
+[Unit]
+Description=SteamOS Big Picture session (gamescope on DRM/KMS)
+After=systemd-user-sessions.service getty@tty1.service
+Conflicts=getty@tty1.service
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=deck
+Group=video render input tty
+PAMName=login
+EnvironmentFile=-/etc/default/deck-session
+ExecStartPre=/usr/local/bin/deck-gpu-prep
+ExecStart=/usr/local/bin/deck-steam-launch
+ExecStopPost=/usr/local/bin/deck-gpu-idle
+Restart=on-failure
+RestartSec=5
+# Нативная песочница вместо bwrap/proot из DroidDeck: привилегии срезаются,
+# но io_uring и devfreq остаются доступны (в APK-пути их режет seccomp Android).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/deck /var/lib/droiddeck /run/kde
+DeviceAllow=/dev/kgsl-3d0 rw
+DeviceAllow=/dev/dri/renderD* rw
+DeviceAllow=/dev/fb0 rw
+DeviceAllow=input-* rw
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+MemoryMax=1700M
+TasksMax=4096
+Slice=deck.slice
+
+[Install]
+WantedBy=multi-user.target
