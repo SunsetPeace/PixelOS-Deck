@@ -9,9 +9,21 @@
 #   scripts/prepare-device.sh dump-partitions    # getvar-разметка -> configs/<dev>.partitions
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
-load_config "${1:-}"
 
-cmd="${TARGET_CMD:-${2:-${1:-help}}}"
+# Аргументы: [download-factory|extract-vendor|dump-partitions] [--device <dev>]
+# (или TARGET_DEVICE=<dev> в окружении). Первый позиционный аргумент — команда.
+DEV="blueline"
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --device) DEV="${2:-blueline}"; shift 2 ;;
+        *) ARGS+=("$1"); shift ;;
+    esac
+done
+export TARGET_DEVICE="$DEV"
+load_config "$DEV"
+
+cmd="${TARGET_CMD:-${ARGS[0]:-help}}"
 
 usage() {
     cat <<EOF
@@ -26,21 +38,47 @@ download_factory() {
     mkdir -p "$dir"
     # Google не публикует стабильный URL без токена согласия; скрипт принимает
     # локальный путь через FACTORY_LOCAL в configs/<dev>.conf.local.
-    if [[ -n "${FACTORY_LOCAL:-}" && -f "${FACTORY_LOCAL}" ]]; then
-        log "использую локальный factory-архив ${FACTORY_LOCAL}"
-        cp -f "$FACTORY_LOCAL" "$dir/"
+    # Допускаются оба написания имени архива: каноническое Google
+    # (blueline-sp1a.210812.016.c2-factory-<hash>.zip) и с точками между
+    # компонентами build-id (sp1a.210812.016.c2), как их отдаёт зеркало.
+    local base
+    base=$(printf '%s' "$ANDROID_BASELINE" | tr 'A-Z' 'a-z')          # sp1a.210812.016.c2
+    local dotted="${base//./-}"                                        # sp1a-210812-016-c2
+    if [[ -n "${FACTORY_LOCAL:-}" ]]; then
+        # Windows-пути (C:\...) и MSYS (/c/...) конвертируем, если есть wslpath/msys
+        local src="$FACTORY_LOCAL"
+        if [[ "$src" == *:\\* || "$src" == *[A-Za-z]:*/* ]] && command -v wslpath >/dev/null 2>&1; then
+            src=$(wslpath -u "$src")
+        fi
+        src=${src//\~/$HOME}
+        if [[ ! -f "$src" ]]; then
+            die "FACTORY_LOCAL='$FACTORY_LOCAL' → файл не найден ('$src'). Скопируйте zip на сборочный хост (например в cache/) и поправьте configs/blueline.conf.local"
+        fi
+        case "$(basename "$src")" in
+            *factory*.zip) ;;
+            *) warn "имен '${src}' не содержит 'factory' — продолжаем, но проверьте, что это factory-архив blueline" ;;
+        esac
+        log "использую локальный factory-архив $src"
+        cp -f "$src" "$dir/"
     else
-        die "положите blueline factory-${ANDROID_BASELINE}.zip в cache/ или задайте FACTORY_LOCAL в configs/blueline.conf.local (страница загрузок: https://developers.google.com/android/images)"
+        # fallback: любой подходящий factory-zip уже в cache/ или build/factory
+        local cand
+        cand=$(find "${CACHE_DIR:-${REPO_ROOT}/cache}" "$dir" -maxdepth 1 \
+                  \( -name "*${base}*factory*.zip" -o -name "*${dotted}*factory*.zip" \) 2>/dev/null | head -1)
+        [[ -n "$cand" ]] || die "factory-архив для ${ANDROID_BASELINE} не задан. Скачайте вручную (https://developers.google.com/android/images → Pixel 3 → ${ANDROID_BASELINE}) и укажите путь FACTORY_LOCAL в configs/blueline.conf.local, либо положите zip в cache/"
+        log "нашёл factory-архив в кэше: $cand"
+        cp -f "$cand" "$dir/"
     fi
     local zip
     zip=$(find "$dir" -maxdepth 1 -name '*factory*.zip' | head -1)
     [[ -n "$zip" ]] || die "в $dir нет factory-архива"
     local sumfile="${REPO_ROOT}/checksums/$(basename "$zip").sha256"
+    mkdir -p "${REPO_ROOT}/checksums"
     if [[ -f "$sumfile" ]]; then
         (cd "$(dirname "$zip")" && sha256sum -c "$sumfile")
     else
-        warn "нет checksums/$(basename "$zip").sha256 — зафиксируйте хеш вручную после первой загрузки"
-        sha256sum "$zip" >"$sumfile"
+        warn "нет checksums/$(basename "$zip").sha256 — фиксирую хеш автоматически (сверьте с https://developers.google.com/android/images)"
+        (cd "$(dirname "$zip")" && sha256sum "$(basename "$zip")") >"$sumfile"
     fi
     log "распаковка $(basename "$zip")"
     unzip -q -o "$zip" -d "$dir"
