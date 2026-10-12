@@ -5,10 +5,13 @@
 # Запуск: scripts/test-thermal-guard.sh  (выход 0 = все сценарии прошли)
 set -u
 INTERP="${TG_INTERP:-$(command -v bash || echo sh)}"
-TG_INTERP_SUB="$INTERP" "$INTERP" - <<'TESTEOF'
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-R="$(mktemp -d /tmp/tg-test.XXXXXX)"; trap 'rm -rf "$R"' EXIT
+R="$(mktemp -d /tmp/tg-test.XXXXXX)"
+trap 'rm -rf "$R"' EXIT
+TG_REPO="$REPO" TG_R="$R" TG_INTERP_SUB="$INTERP" "$INTERP" - <<'TESTEOF'
 PASS=0; FAIL=0
+# R и REPO наследуются из окружения родителя (quoted-here-doc)
+R="${TG_R:?}"; REPO="${TG_REPO:?}"
 
 ok()   { PASS=$((PASS+1)); echo "  [PASS] $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
@@ -39,6 +42,12 @@ for c in 0 1 2 3; do echo 1 > "$R/sys/devices/system/cpu/cpu$c/online"; done
 touch "$R/proc/sysrq-trigger"
 
 GUARD="$REPO/overlay/usr/local/bin/deck-thermal-guard"
+# Конфиг для guard'а генерируется ИЗ configs/blueline.conf (секция THERMAL_*) —
+# тест проверяет реальные пороги проекта, а не хардкод. Guard читает TG_CONF.
+awk '/^THERMAL_/{split($1,a,"="); sub(/^THERMAL_/,"",a[1]); print a[1]"="a[2]}' \
+    "$REPO/configs/blueline.conf" | sed -e 's/_M=/=/' > "$R/etc/default/deck-thermal"
+export TG_CONF="$R/etc/default/deck-thermal"
+grep -q '^WARN_CPU=' "$TG_CONF" || { echo "FATAL: не удалось извлечь THERMAL_* из blueline.conf"; exit 1; }
 # ВАЖНО: префикс окружения внутри строковой переменной НЕ раскрывается как
 # env-присвоение при unquoted-$ разворачивании — экспорт глобально + функции-обёртки.
 export SYS_PREFIX="$R"
