@@ -1,0 +1,49 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+# Подготовка GPU/CPU к игровой сессии на Snapdragon 845 (A630).
+# Аналог DroidDeck `droiddeckctl boost`, но без необходимости в root-APK:
+# мы сами в init и пишем напрямую в sysfs.
+set -e
+
+KGSL=/sys/class/kgsl/kgsl-3d0
+DEVFREQ_GPU=$(ls -d /sys/class/devfreq/*kgsl-3d0* 2>/dev/null | head -1 || true)
+
+boost_gpu() {
+    if [ -d "$KGSL" ]; then
+        # KGSL (vendor-ядро Pixel 3): фиксированный top-step + отключить idle collapse
+        echo 1 > "$KGSL/force_gpu_active" 2>/dev/null || true
+        MAX=$(cat "$KGSL/max_gpuclk" 2>/dev/null || echo 710000000)
+        echo "$MAX" > "$KGSL/min_gpuclk" 2>/dev/null || true
+        echo "$MAX" > "$KGSL/gpuclk" 2>/dev/null || true
+        echo "simple" > "$KGSL/devfreq/devfreq*/governor" 2>/dev/null || true
+    elif [ -n "$DEVFREQ_GPU" ]; then
+        # msm-gpu (GKI 6.6): userspace governor, ставим ceiling
+        echo "userspace" > "$DEVFREQ_GPU/governor" 2>/dev/null || true
+        TOP=$(tr ' ' '\n' < "$DEVFREQ_GPU/available_frequencies" | sort -n | tail -1)
+        echo "$TOP" > "$DEVFREQ_GPU/scaling_max_freq" 2>/dev/null || true
+        echo "$TOP" > "$DEVFREQ_GPU/scaling_min_freq" 2>/dev/null || true
+    fi
+}
+
+tune_cpu() {
+    for p in /sys/devices/system/cpu/cpufreq/policy*; do
+        [ -d "$p" ] || continue
+        echo schedutil > "$p/scaling_governor" 2>/dev/null || true
+        echo 1 > "$p/schedutil/rate_limit_us_reset" 2>/dev/null || true
+        # rate_limit 0 = мгновенный up-ramp (важно для 60 fps на big cores)
+        echo 0 > "$p/schedutil/up_rate_limit_us" 2>/dev/null || true
+        echo 10000 > "$p/schedutil/down_rate_limit_us" 2>/dev/null || true
+    done
+    # SMT выключен на Kryo; гарантируем, что big cluster не паркуется
+    for c in 4 5 6 7; do
+        [ -w "/sys/devices/system/cpu/cpu$c/online" ] && echo 1 > "/sys/devices/system/cpu/cpu$c/online" || true
+    done
+}
+
+disable_sleep_inhibitors() {
+    # Не даём системе уйти в suspend во время игры (аналог wakelock DroidDeck)
+    [ -w /sys/power/wake_lock ] && echo deck-session > /sys/power/wake_lock || true
+}
+
+boost_gpu; tune_cpu; disable_sleep_inhibitors
+echo "gpu/cpu prepared for session" >&2

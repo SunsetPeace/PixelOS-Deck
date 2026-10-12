@@ -1,0 +1,68 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-3.0-only
+# minikinit: монтирует targetfs (erofs, dm-verity) и systemd, поднимает
+# vendor/tmpfs/proc/sys перед switch_root. Только busybox-утилиты.
+set -e
+export PATH=/bin:/sbin
+
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /proc /sys /run /tmp /mnt/target /mnt/vendor
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+
+# --- параметры из cmdline -------------------------------------------------
+ROOTPART=""
+SLOT="_a"
+for p in $(cat /proc/cmdline); do
+    case "$p" in
+        deck.root=*)     ROOTPART="${p#deck.root=}" ;;
+        androidboot.slot_suffix=*) SLOT="${p#androidboot.slot_suffix=}" ;;
+    esac
+done
+[ -n "$ROOTPART" ] || { echo "deck.root не задан в cmdline"; exec /bin/sh; }
+
+# --- разрешить UUID:/PARTNAME: --------------------------------------------
+resolve() {
+    case "$1" in
+        PARTNAME:*)
+            local name="${1#PARTNAME:}"
+            for d in /dev/disk/by-partlabel/*; do
+                [ "$(basename "$d")" = "$name$SLOT" ] && readlink -f "$d" && return 0
+            done
+            for d in /dev/disk/by-partlabel/*; do
+                [ "$(basename "$d")" = "$name" ] && readlink -f "$d" && return 0
+            done ;;
+        UUID:*)
+            readlink -f "/dev/disk/by-uuid/${1#UUID:}" ;;
+        *) echo "$1" ;;
+    esac
+    return 1
+}
+DEV="$(resolve "$ROOTPART")" || { echo "не найден root $ROOTPART"; sleep 5; exec /bin/sh; }
+
+# --- A/B fallback: если erofs-образ повреждён, пробуем другой слот --------
+try_mount() {
+    mount -t erofs -o ro "$1" /mnt/target 2>/dev/null && return 0
+    mount -t ext4 -o ro "$1" /mnt/target 2>/dev/null && return 0
+    return 1
+}
+if ! try_mount "$DEV"; then
+    OTHER="${DEV%_a}_b"; [ "$OTHER" = "$DEV" ] && OTHER="${DEV%_b}_a"
+    echo "root $DEV не монтируется, пробую $OTHER"
+    try_mount "$OTHER" || { echo "оба слота недоступны"; exec /bin/sh; }
+fi
+
+# --- vendor остаётся андроидным (HAL, прошивки модема/GPU) -----------------
+VENDOR="$(resolve PARTNAME:vendor)" && mount -o ro "$VENDOR" /mnt/vendor || \
+    echo "warning: vendor не смонтирован — графика через blob работать не будет"
+
+# --- bind каталогов будущего корня ----------------------------------------
+mkdir -p /mnt/target/dev /mnt/target/proc /mnt/target/sys /mnt/target/run /mnt/target/tmp /mnt/target/vendor
+mount --rbind /dev /mnt/target/dev
+mount --rbind /proc /mnt/target/proc
+mount --rbind /sys /mnt/target/sys
+
+echo "switch_root -> systemd на $DEV"
+exec switch_root /mnt/target /lib/systemd/systemd

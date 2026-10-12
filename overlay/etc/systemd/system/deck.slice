@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-only
+[Slice]
+CPUWeight=1000
+IOWeight=1000
+MemoryHigh=1800M

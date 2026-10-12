@@ -1,0 +1,5 @@
+Реестр релизов ядра, к которым применимы патчи patches/kernel/*.patch
+(сверять `git log --oneline` при обновлении baseline):
+
+* msm-4.9 android-msm-4.9-android11            — базовый vendor-Pixel3 (SQ1A.*)
+* android15-6.6 gki                             — целевой GKI (переход planned)

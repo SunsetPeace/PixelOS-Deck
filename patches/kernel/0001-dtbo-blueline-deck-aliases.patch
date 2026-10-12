@@ -1,0 +1,31 @@
+From: PixelOS-Deck <dev@localhost>
+Subject: [PATCH] arm64: dts: qcom: blueline: deck aliases, bootargs and gpu devfreq
+
+Добавляет DT-алиасы для targetfs (см. docs/kernel-porting.md):
+  - /chosen/bootargs дополняется deck.root=PARTNAME:system (minikinit парсит);
+  - алиас gpu0 -> &gpu, чтобы udev правило 70-deck-gpu.rules было стабильным;
+  - devfreq-узел adreno с governor simple-ondemand по умолчанию.
+
+Патч накладывается только на vendor-DT (msm-4.9). На GKI 6.6 эквивалентный
+overlay делается отдельным .dtso (recipes/dtbo.sh — TODO).
+
+--- a/arch/arm64/boot/dts/qcom/msm8998-pixel3.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8998-pixel3.dtsi
+@@ -12,6 +12,10 @@
+ / {
+ aliases {
++gpu0 = &gpu;
++serial0 = &uart2;
+ mmc1 = &sdhc_1;
+ };
+ 
++chosen {
++bootargs = "deck.root=PARTNAME:system androidboot.console=ttyMSM0";
++};
+ };
+ 
+ &gpu {
+ status = "ok";
++operating-points-v2 = <&gpu_opp_table>;
++qcom,gpu-devfreq-governor = "simple-ondemand";
+ };

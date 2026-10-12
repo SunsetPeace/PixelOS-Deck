@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+# Возврат к энергосбережению после остановки сессии.
+KGSL=/sys/class/kgsl/kgsl-3d0
+DEVFREQ_GPU=$(ls -d /sys/class/devfreq/*kgsl-3d0* 2>/dev/null | head -1 || true)
+[ -d "$KGSL" ] && { echo 0 > "$KGSL/force_gpu_active" 2>/dev/null; echo 32000000 > "$KGSL/min_gpuclk" 2>/dev/null; } || true
+[ -n "$DEVFREQ_GPU" ] && echo "powersave" > "$DEVFREQ_GPU/governor" 2>/dev/null || true
+for p in /sys/devices/system/cpu/cpufreq/policy*; do
+    [ -d "$p" ] && echo "schedutil" > "$p/scaling_governor" 2>/dev/null || true
+done
+[ -w /sys/power/wake_unlock ] && echo deck-session > /sys/power/wake_unlock || true
